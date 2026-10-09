@@ -161,8 +161,10 @@ fi
 # dihedrals but leave the backbone conformational term at full strength — a partially
 # scaled Hamiltonian that neither the scale=1.0 sanity pair nor the hrex acceptance gate
 # can detect. Fail here rather than produce a plausible-looking wrong ensemble.
-# AMBER (amber99sb-ildn, amber14sb) has no CMAP and is unaffected. T-REMD and plain MD
-# scale nothing, so CHARMM is fully correct there. See knowledgebase/GOTCHAS.md.
+# AMBER (amber99sb-ildn, amber14sb, a99SB-disp) has no CMAP and is unaffected. T-REMD and
+# plain MD scale nothing, so CHARMM is fully correct there. See knowledgebase/GOTCHAS.md.
+# This name check only fails CHARMM early (before any compute); the real guard is STEP 7's
+# check_rest2_topology.py, which rejects [ cmap ] from ANY force field (e.g. AMBER ff19SB).
 if [[ "$FF" == charmm* ]]; then
   echo "[ERROR] FF='${FF}' is not supported by the REST2 engine." >&2
   echo "[ERROR] plumed partial_tempering does not scale CHARMM CMAP ([ cmap ]/[ cmaptypes ])," >&2
@@ -611,6 +613,15 @@ for i in $(seq 0 $((REPLICAS-1))); do
   [[ -s "${TOPOL_DIR}/topol_rep${idx}.top" ]] || { echo "[ERROR] partial_tempering failed for rep${idx} (lambda=$lam)"; exit 1; }
 done
 echo "[OK] ${REPLICAS} scaled topologies written (lambda ${LARR[0]}…${LARR[-1]})"
+
+# Check the scaling itself, by content rather than by FF name: hot charges x sqrt(lambda),
+# hot LJ eps x lambda (incl. [ nonbond_params ] overrides like a99SB-disp's backbone O-H),
+# dihedral k x lambda, bonds/angles untouched — and no section partial_tempering cannot
+# scale ([ cmap ], ...). rep000 vs the lowest-lambda replica, where any error is largest.
+LAST_IDX=$(printf "%03d" "$((REPLICAS-1))")
+python3 "${GROMACS_SCRIPTS_DIR}/check_rest2_topology.py" \
+  "${TOPOL_DIR}/topol_rep000.top" "${TOPOL_DIR}/topol_rep${LAST_IDX}.top" \
+  --lambda-cold "${LARR[0]}" --lambda-hot "${LARR[-1]}" 2>&1 | tee "${TOPOL_DIR}/check_rest2_topology.log"
 
 ###############################################################################
 # STEP 8 — Prepare per-replica equilibration (all at T_MIN, scaled Hamiltonians)

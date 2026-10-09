@@ -174,6 +174,14 @@ if [[ "$FF" == charmm* ]]; then
   exit 1
 fi
 WATER="${WATER:-tip3p}"
+# Resolve WATER against the FF's own watermodels.dat now, so a bad value fails before any
+# compute: pdb2gmx -water only accepts GROMACS's built-in names (an FF-specific water like
+# a99SB-disp's a99SBdisp_water goes through `-water select`), and solvate needs a box with
+# the model's site count (4-site water in a 3-site spc216 box is a fatal grompp mismatch).
+# 3-site built-ins resolve to exactly the previous `-water $WATER` + spc216.gro.
+WATER_RESOLVED="$(python3 "${GROMACS_SCRIPTS_DIR}/resolve_water.py" "$FF" "$WATER" ${GMXLIB//:/ } "${GMXDATA}/top")"
+read -r PDB2GMX_WATER WATER_MENU_ANSWER WATER_SITES SOLVENT_BOX <<< "$WATER_RESOLVED"
+echo "[INFO] Water model '${WATER}': ${WATER_SITES}-site, solvent box ${SOLVENT_BOX}"
 BOX_SHAPE="${BOX_SHAPE:-dodecahedron}"
 BOX_BUFFER="${BOX_BUFFER:-1.0}"
 NEUTRALIZE="${NEUTRALIZE:-1}"
@@ -368,15 +376,23 @@ echo "===== STEP 3: Building system ====="
 BUILD="${OUTDIR}/build"
 
 echo "[INFO] Running pdb2gmx (ff=${FF}, water=${WATER})…"
-$GMX pdb2gmx -f "$PDB_IN" -o "${BUILD}/${OUTBASE}_processed.gro" -p "${BUILD}/${OUTBASE}.top" \
-  -i "${BUILD}/${OUTBASE}_posre.itp" -ff "$FF" -water "$WATER" -ignh > "${BUILD}/pdb2gmx.log" 2>&1
+PDB2GMX_ARGS=(-f "$PDB_IN" -o "${BUILD}/${OUTBASE}_processed.gro" -p "${BUILD}/${OUTBASE}.top"
+  -i "${BUILD}/${OUTBASE}_posre.itp" -ff "$FF" -water "$PDB2GMX_WATER" -ignh)
+if [[ "$WATER_MENU_ANSWER" == "-" ]]; then
+  $GMX pdb2gmx "${PDB2GMX_ARGS[@]}" > "${BUILD}/pdb2gmx.log" 2>&1
+else
+  echo "$WATER_MENU_ANSWER" | $GMX pdb2gmx "${PDB2GMX_ARGS[@]}" > "${BUILD}/pdb2gmx.log" 2>&1
+fi
+# `-water select` answers a menu by number — confirm the topology got the model we meant.
+grep -qE "#include \".*/${WATER}\.itp\"" "${BUILD}/${OUTBASE}.top" \
+  || { echo "[ERROR] pdb2gmx topology does not include ${WATER}.itp — see ${BUILD}/pdb2gmx.log"; exit 1; }
 
 echo "[INFO] Setting up ${BOX_SHAPE} box with ${BOX_BUFFER} nm buffer…"
 $GMX editconf -f "${BUILD}/${OUTBASE}_processed.gro" -o "${BUILD}/${OUTBASE}_box.gro" \
   -bt "$BOX_SHAPE" -d "$BOX_BUFFER" -c > "${BUILD}/editconf.log" 2>&1
 
 echo "[INFO] Solvating…"
-$GMX solvate -cp "${BUILD}/${OUTBASE}_box.gro" -cs spc216.gro \
+$GMX solvate -cp "${BUILD}/${OUTBASE}_box.gro" -cs "$SOLVENT_BOX" \
   -o "${BUILD}/${OUTBASE}_solv.gro" -p "${BUILD}/${OUTBASE}.top" > "${BUILD}/solvate.log" 2>&1
 
 cat > "${BUILD}/ions.mdp" <<EOF
@@ -823,6 +839,7 @@ Hot region: whole protein
 Total ns per replica: $TOTAL_NS
 Force field: $FF${FF_ALIAS_NOTE}
 Water model: $WATER
+Solvent box: $SOLVENT_BOX (${WATER_SITES}-site)
 Box shape: $BOX_SHAPE ; buffer (nm): $BOX_BUFFER
 Neutralize: $NEUTRALIZE ; Salt molarity: $SALT_MOLAR
 Cutoff (nm): $CUTOFF_NM ; tau_t (ps): $TAU_T ; Time step (ps): $DT_PS
